@@ -1,0 +1,422 @@
+diff --git a/BunnymodXT/modules/HwDLL.cpp b/BunnymodXT/modules/HwDLL.cpp
+index 615e744..9b0379e 100644
+--- a/BunnymodXT/modules/HwDLL.cpp
++++ b/BunnymodXT/modules/HwDLL.cpp
+@@ -25,6 +25,12 @@
+ #include "../splits.hpp"
+ #include "../helper_functions.hpp"
+ 
++#ifndef _WIN32
++#include <fcntl.h>
++#include <sys/wait.h>
++#include <unistd.h>
++#endif
++
+ using namespace std::literals;
+ 
+ // Callbacks for bxt-rs.
+@@ -2787,6 +2793,304 @@ struct HwDLL::Cmd_BXT_TAS_Split
+ 	}
+ };
+ 
++
++// ---- fork: branch a running TAS with fork(2) -------------------------------
++//
++// A child continues from the exact frame the parent forked on, with the rest
++// of the script replaced. Everything already played must be identical, so a
++// child's run equals a linear run of the child's script.
++
++// Serializes the first n frame bulks; the bulk at index `partial` (if any) is
++// compared with its repeat count normalized, since it may only get longer.
++static std::string SerializeFramePrefix(const std::vector<HLTAS::Frame>& frames, size_t n, size_t partial)
++{
++	HLTAS::Input tmp;
++	for (size_t i = 0; i < n; ++i) {
++		HLTAS::Frame f = frames[i];
++		if (i == partial)
++			f.SetRepeats(1);
++		tmp.InsertFrame(i, f);
++	}
++
++	// Grow as needed: a large zeroed buffer would cost every fork child
++	// thousands of page faults.
++	std::vector<char> buf(1 << 16);
++	while (tmp.ToString(buf.data(), buf.size()).Code != HLTAS::ErrorCode::OK) {
++		if (buf.size() >= (1u << 28))
++			return "<unserializable>";
++		buf.resize(buf.size() * 4);
++	}
++	return std::string(buf.data());
++}
++
++// The played prefix, serialized once by bxt_fork before forking, so that each
++// child only serializes its own script.
++static struct {
++	size_t n = SIZE_MAX, partial = SIZE_MAX;
++	std::string text;
++} forkPlayedPrefix;
++
++bool HwDLL::ContinueTASScript(const char *fileName)
++{
++	if (!runningFrames) {
++		ORIG_Con_Printf("_bxt_tas_continue: no TAS script is running.\n");
++		return false;
++	}
++
++	HLTAS::Input next;
++	auto err = next.Open(fileName);
++	if (err.Code != HLTAS::ErrorCode::OK) {
++		ORIG_Con_Printf("_bxt_tas_continue: error loading %s on line %u: %s\n", fileName, err.LineNumber, HLTAS::GetErrorMessage(err).c_str());
++		return false;
++	}
++
++	const auto& played = input.GetFrames();
++	const auto& frames = next.GetFrames();
++	const size_t n = currentFramebulk + (currentRepeat ? 1 : 0);
++	const size_t partial = currentRepeat ? currentFramebulk : SIZE_MAX;
++
++	if (next.GetProperties() != input.GetProperties()
++			|| frames.size() < n
++			|| (currentRepeat && frames[currentFramebulk].GetRepeats() <= currentRepeat)
++			|| SerializeFramePrefix(frames, n, partial) != (forkPlayedPrefix.n == n && forkPlayedPrefix.partial == partial
++				? forkPlayedPrefix.text : SerializeFramePrefix(played, n, partial))) {
++		ORIG_Con_Printf("_bxt_tas_continue: %s does not match the part already played (%zu bulks, %u frames into the last).\n", fileName, currentFramebulk, currentRepeat);
++		return false;
++	}
++
++	input = std::move(next);
++	totalFramebulks = input.GetFrames().size();
++
++	// The frame time of the coming frame was already chosen, by looking ahead
++	// into the old script (InsertCommands queues host_framerate before the
++	// frame's own commands, including the one that got us here). Choose it again
++	// from the new script, unless a 0 ms frame is queued: that decision comes
++	// from the frame just played, which both scripts share.
++	if (!thisFrameIs0ms) {
++		HLTAS::Frame upcoming;
++		if (GetNextMovementFrame(upcoming)) {
++			std::ostringstream ss;
++			ss << "host_framerate " << upcoming.Frametime << "\n";
++			ORIG_Cbuf_InsertText(ss.str().c_str());
++		}
++	}
++	totalFrames = 0;
++	for (size_t i = currentFramebulk; i < totalFramebulks; ++i) {
++		const auto& f = input.GetFrame(i);
++		if (f.IsMovement())
++			totalFrames += f.GetRepeats() - (i == currentFramebulk ? currentRepeat : 0);
++	}
++	return true;
++}
++
++struct HwDLL::Cmd_BXT_TAS_Continue
++{
++	USAGE("Usage: _bxt_tas_continue <filename>\n Replaces the rest of the running .hltas script with the frames of another script. Everything already played must be identical in both.\n");
++
++	static void handler(const char *fileName)
++	{
++		HwDLL::GetInstance().ContinueTASScript(fileName);
++	}
++};
++
++#ifndef _WIN32
++void HwDLL::BecomeForkChild(const char *scriptName, const char *logName)
++{
++	// Leave the parent's log without writing to it: point the inherited
++	// descriptor at /dev/null, then close the log as usual.
++	if (tasLogging) {
++		int devnull = open("/dev/null", O_WRONLY);
++		dup2(devnull, fileno(tasLogFile));
++		close(devnull);
++		SetTASLogging(false);
++	}
++
++	if (logName[0]) {
++		CVars::bxt_taslog_filename.Set(logName);
++		SetTASLogging(true);
++	}
++	forkChildLog = logName;
++	forkChild = true;
++
++	if (!ContinueTASScript(scriptName))
++		_exit(2);
++
++	// A hung child would stall its worker forever.
++	const char *timeout = std::getenv("BXT_FORK_TIMEOUT");
++	alarm(timeout ? std::atoi(timeout) : 120);
++}
++#endif
++
++#ifndef _WIN32
++// A fork child ends where its run leaves the map: the log holds every frame up
++// to the one that caused it, and <log>.end says why ("changelevel c1a3").
++// Loading a map would only cost time, and children would race on save files.
++void HwDLL::EndForkChild(const char *why, const char *map)
++{
++	if (!forkChildLog.empty()) {
++		if (FILE *f = std::fopen((forkChildLog + ".end").c_str(), "w")) {
++			std::fprintf(f, "%s %s\n", why, map);
++			std::fclose(f);
++		}
++	}
++	SetTASLogging(false);
++	std::fflush(nullptr);
++	_exit(0);
++}
++
++// Runs one batch of `count` children from the current frame through a fork
++// tree (one worker per job, each forking its share serially: forking a big
++// process is slow, so the parent alone would bottleneck). Returns true in a
++// child, which must then return and play on; false in the parent once all
++// children have finished.
++bool HwDLL::RunForkBatch(int count, int jobs, const char *scriptPattern, const char *logPattern, int& started, int& failed)
++{
++	auto& hw = *this;
++	if (jobs < 1)
++		jobs = 1;
++	started = failed = 0;
++
++	forkPlayedPrefix.n = hw.currentFramebulk + (hw.currentRepeat ? 1 : 0);
++	forkPlayedPrefix.partial = hw.currentRepeat ? hw.currentFramebulk : SIZE_MAX;
++	forkPlayedPrefix.text = SerializeFramePrefix(hw.input.GetFrames(), forkPlayedPrefix.n, forkPlayedPrefix.partial);
++
++	// Children must not inherit buffered output.
++	std::fflush(nullptr);
++
++	std::vector<pid_t> workers;
++	for (int w = 0; w < jobs && w < count; ++w) {
++		const pid_t pid = fork();
++		if (pid == 0) {
++			int bad = 0;
++			for (int i = w; i < count; i += jobs) {
++				char script[1024], log[1024];
++				std::snprintf(script, sizeof script, scriptPattern, i);
++				std::snprintf(log, sizeof log, logPattern, i);
++
++				const pid_t child = fork();
++				if (child == 0) {
++					hw.BecomeForkChild(script, log);
++					return true;
++				}
++				int status = 0;
++				if (child < 0 || waitpid(child, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
++					++bad;
++			}
++			_exit(bad > 254 ? 254 : bad);
++		}
++		if (pid < 0) {
++			hw.ORIG_Con_Printf("bxt_fork: fork failed: %s\n", std::strerror(errno));
++			break;
++		}
++		workers.push_back(pid);
++		started += (count - w + jobs - 1) / jobs;
++	}
++	for (pid_t pid : workers) {
++		int status = 0;
++		if (waitpid(pid, &status, 0) < 0 || !WIFEXITED(status))
++			failed += (count + jobs - 1) / jobs;
++		else
++			failed += WEXITSTATUS(status);
++	}
++
++	forkPlayedPrefix.n = SIZE_MAX;
++	return false;
++}
++#endif
++
++struct HwDLL::Cmd_BXT_Fork
++{
++	USAGE("Usage: bxt_fork <count> <jobs> <script_pattern> <log_pattern>\n Forks <count> copies of the game at this frame, at most <jobs> running at once. Child i continues with the script <script_pattern> and logs to <log_pattern> (printf-style, %d is i; an empty log pattern disables logging). The parent waits for all children, then continues. Linux only.\n");
++
++	static void handler(int count, int jobs, const char *scriptPattern, const char *logPattern)
++	{
++#ifdef _WIN32
++		HwDLL::GetInstance().ORIG_Con_Printf("bxt_fork is only available on Linux.\n");
++#else
++		auto& hw = HwDLL::GetInstance();
++		if (!hw.runningFrames) {
++			hw.ORIG_Con_Printf("bxt_fork: no TAS script is running.\n");
++			return;
++		}
++
++		const auto start = std::chrono::steady_clock::now();
++		int started, failed;
++		if (hw.RunForkBatch(count, jobs, scriptPattern, logPattern, started, failed))
++			return; // A child: play on from here.
++
++		const std::chrono::duration<double> took = std::chrono::steady_clock::now() - start;
++		hw.ORIG_Con_Printf("bxt_fork: %d children in %.3f s, %d failed.\n", started, took.count(), failed);
++#endif
++	}
++};
++
++struct HwDLL::Cmd_BXT_Fork_Serve
++{
++	USAGE("Usage: bxt_fork_serve <request_fifo> <reply_fifo>\n Stays at this frame and serves batches of forked children. Each request line is \"batch <count> <jobs> <script_pattern> <log_pattern>\" (as bxt_fork; \"-\" for no log) and is answered with \"done <started> <failed> <seconds>\"; \"quit\" ends serving and the script plays on. Linux only.\n");
++
++	static void handler(const char *requestPath, const char *replyPath)
++	{
++#ifdef _WIN32
++		HwDLL::GetInstance().ORIG_Con_Printf("bxt_fork_serve is only available on Linux.\n");
++#else
++		auto& hw = HwDLL::GetInstance();
++		if (!hw.runningFrames) {
++			hw.ORIG_Con_Printf("bxt_fork_serve: no TAS script is running.\n");
++			return;
++		}
++
++		FILE *requests = std::fopen(requestPath, "r");
++		FILE *replies = std::fopen(replyPath, "w");
++		if (!requests || !replies) {
++			hw.ORIG_Con_Printf("bxt_fork_serve: cannot open %s / %s: %s\n", requestPath, replyPath, std::strerror(errno));
++			if (requests) std::fclose(requests);
++			if (replies) std::fclose(replies);
++			return;
++		}
++
++		char line[4096];
++		while (std::fgets(line, sizeof line, requests)) {
++			int count, jobs;
++			char scriptPattern[1024], logPattern[1024];
++			if (std::sscanf(line, "batch %d %d %1023s %1023s", &count, &jobs, scriptPattern, logPattern) == 4) {
++				const char *log = std::strcmp(logPattern, "-") ? logPattern : "";
++				const auto start = std::chrono::steady_clock::now();
++				int started, failed;
++				if (hw.RunForkBatch(count, jobs, scriptPattern, log, started, failed))
++					return; // A child: leave the server's files alone and play on.
++				const std::chrono::duration<double> took = std::chrono::steady_clock::now() - start;
++				std::fprintf(replies, "done %d %d %.6f\n", started, failed, took.count());
++			} else if (!std::strncmp(line, "quit", 4)) {
++				break;
++			} else {
++				std::fprintf(replies, "error bad request\n");
++			}
++			std::fflush(replies);
++		}
++
++		std::fclose(requests);
++		std::fclose(replies);
++#endif
++	}
++};
++
++struct HwDLL::Cmd_BXT_Fork_Exit
++{
++	USAGE("Usage: _bxt_fork_exit\n Finishes the TAS log and exits at once, skipping engine shutdown. Ends a bxt_fork child.\n");
++
++	static void handler()
++	{
++		auto& hw = HwDLL::GetInstance();
++		hw.SetTASLogging(false);
++		std::fflush(nullptr);
++#ifdef _WIN32
++		std::exit(0);
++#else
++		_exit(0);
++#endif
++	}
++};
++
+ extern "C" DLLEXPORT void bxt_tas_new(const char *filename, const char *command, const char *frametime, int is_for_tas_studio)
+ {
+ 	auto &hw = HwDLL::GetInstance();
+@@ -5852,6 +6156,10 @@ void HwDLL::RegisterCVarsAndCommandsIfNeeded()
+ 	wrapper::Add<Cmd_BXT_TAS_ExportScript, Handler<const char *>>("bxt_tas_exportscript");
+ 	wrapper::Add<Cmd_BXT_TAS_ExportLibTASInput, Handler<const char *>>("bxt_tas_export_libtas_input");
+ 	wrapper::Add<Cmd_BXT_TAS_Split, Handler<const char *>>("bxt_tas_split");
++	wrapper::Add<Cmd_BXT_TAS_Continue, Handler<const char *>>("_bxt_tas_continue");
++	wrapper::Add<Cmd_BXT_Fork, Handler<int, int, const char *, const char *>>("bxt_fork");
++	wrapper::Add<Cmd_BXT_Fork_Exit, Handler<>>("_bxt_fork_exit");
++	wrapper::Add<Cmd_BXT_Fork_Serve, Handler<const char *, const char *>>("bxt_fork_serve");
+ 	wrapper::Add<Cmd_BXT_TAS_Editor_New, Handler<const char *, const char *, int>>("bxt_tas_editor_new");
+ 	wrapper::Add<Cmd_BXT_TAS_Check_Position, Handler<float, float, float>>("_bxt_tas_check_position");
+ 	wrapper::AddCheat<Cmd_BXT_CH_Set_Health, Handler<float>>("bxt_ch_set_health");
+@@ -7555,6 +7863,11 @@ HOOK_DEF_0(HwDLL, void, __cdecl, Host_Changelevel2_f)
+ 		dontStopAutorecord = false;
+ 	}
+ 
++#ifndef _WIN32
++	if (forkChild)
++		EndForkChild("changelevel", ORIG_Cmd_Argc && ORIG_Cmd_Argc() > 1 ? ORIG_Cmd_Argv(1) : "");
++#endif
++
+ 	insideHost_Changelevel2_f = true;
+ 	ORIG_Host_Changelevel2_f();
+ 	insideHost_Changelevel2_f = false;
+@@ -7670,6 +7983,13 @@ HOOK_DEF_0(HwDLL, void, __cdecl, R_DrawSkyBox)
+ 
+ HOOK_DEF_3(HwDLL, int, __cdecl, SV_SpawnServer, int, bIsDemo, char*, server, char*, startspot)
+ {
++#ifndef _WIN32
++	// Any other new map in a fork child (a reload after death, a load) ends it
++	// too, unless BXT_FORK_ALLOW_LOADS is set (saves are private per child).
++	if (forkChild && !std::getenv("BXT_FORK_ALLOW_LOADS"))
++		EndForkChild("spawn", server ? server : "");
++#endif
++
+ 	auto ret = ORIG_SV_SpawnServer(bIsDemo, server, startspot);
+ 
+ 	ServerDLL::GetInstance().ClearTPLandmarks();
+@@ -7734,6 +8054,13 @@ HOOK_DEF_0(HwDLL, void, __cdecl, CL_Stop_f)
+ 
+ HOOK_DEF_0(HwDLL, void, __cdecl, Host_Loadgame_f)
+ {
++#ifndef _WIN32
++	// Before anything else: shutting the server down talks to Steam, which a
++	// fork child cannot (it would wait for a reply forever).
++	if (forkChild && !std::getenv("BXT_FORK_ALLOW_LOADS"))
++		EndForkChild("load", ORIG_Cmd_Argc && ORIG_Cmd_Argc() > 1 ? ORIG_Cmd_Argv(1) : "");
++#endif
++
+ 	insideHost_Loadgame_f = true;
+ 
+ 	ORIG_Host_Loadgame_f();
+@@ -7743,6 +8070,13 @@ HOOK_DEF_0(HwDLL, void, __cdecl, Host_Loadgame_f)
+ 
+ HOOK_DEF_0(HwDLL, void, __cdecl, Host_Reload_f)
+ {
++#ifndef _WIN32
++	// Before anything else: shutting the server down talks to Steam, which a
++	// fork child cannot (it would wait for a reply forever).
++	if (forkChild && !std::getenv("BXT_FORK_ALLOW_LOADS"))
++		EndForkChild("reload", ORIG_Cmd_Argc && ORIG_Cmd_Argc() > 1 ? ORIG_Cmd_Argv(1) : "");
++#endif
++
+ 	insideHost_Reload_f = true;
+ 
+ 	ORIG_Host_Reload_f();
+diff --git a/BunnymodXT/modules/HwDLL.hpp b/BunnymodXT/modules/HwDLL.hpp
+index 8e4d7b2..96d2967 100644
+--- a/BunnymodXT/modules/HwDLL.hpp
++++ b/BunnymodXT/modules/HwDLL.hpp
+@@ -350,6 +350,10 @@ public:
+ 	void CallOnTASPlaybackStopped();
+ 	void ResetTASPlaybackState();
+ 	void StartTASPlayback();
++	bool ContinueTASScript(const char *fileName);
++	void BecomeForkChild(const char *scriptName, const char *logName);
++	void EndForkChild(const char *why, const char *map);
++	bool RunForkBatch(int count, int jobs, const char *scriptPattern, const char *logPattern, int& started, int& failed);
+ 
+ 	void TimerReset();
+ 	void TimerStart();
+@@ -418,6 +422,10 @@ protected:
+ 	struct Cmd_BXT_TAS_ExportScript;
+ 	struct Cmd_BXT_TAS_ExportLibTASInput;
+ 	struct Cmd_BXT_TAS_Split;
++	struct Cmd_BXT_TAS_Continue;
++	struct Cmd_BXT_Fork;
++	struct Cmd_BXT_Fork_Exit;
++	struct Cmd_BXT_Fork_Serve;
+ 	struct Cmd_BXT_TAS_Editor_New;
+ 	struct Cmd_BXT_TAS_Check_Position;
+ 	struct Cmd_BXT_CH_Set_Health;
+@@ -601,6 +609,8 @@ protected:
+ 	bool pauseOnTheFirstFrame;
+ 
+ 	bool tasLogging;
++	bool forkChild = false;
++	std::string forkChildLog;
+ 	std::string loggedCbuf;
+ 	FILE *tasLogFile = nullptr;
+ 	void SetTASLogging(bool enabled);
